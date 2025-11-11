@@ -267,13 +267,18 @@ def main():
     # Get initial balance and price
     price = fetch_price(client, SYMBOL)
     balance_base = fetch_balance(client, base_asset)
+    balance_quote = fetch_balance(client, quote_asset)
 
-    if balance_base <= 0:
-        log(f"No {base_asset} balance to trade.")
+    # Calculate total portfolio value (BNB + USDT)
+    portfolio_value = (balance_base * price) + balance_quote
+
+    if balance_base <= 0 and balance_quote <= 0:
+        log(f"No {base_asset} or {quote_asset} balance to trade.")
         return
 
     # Initialize state
-    baseline_value = balance_base * price
+    # Baseline is total portfolio value, not just BNB value
+    baseline_value = portfolio_value
     cumulative_realized = Decimal("0")
     entry_price = price
 
@@ -295,7 +300,7 @@ def main():
     last_atr_refresh = time.time()
 
     log(
-        f"Started: Price {price:.4f}, Balance {balance_base:.6f} {base_asset}, Baseline {baseline_value:.2f} {quote_asset}"
+        f"Started: Price {price:.4f}, Balance {balance_base:.6f} {base_asset}, {balance_quote:.2f} {quote_asset}, Total Portfolio: {baseline_value:.2f} {quote_asset}"
     )
 
     try:
@@ -303,7 +308,9 @@ def main():
             now = time.time()
             price = fetch_price(client, SYMBOL)
             balance_base = fetch_balance(client, base_asset)
-            current_value = balance_base * price
+            balance_quote = fetch_balance(client, quote_asset)
+            # Current value includes both BNB value and USDT balance
+            current_value = (balance_base * price) + balance_quote
 
             # Refresh ATR every 5 minutes
             if use_atr_stop and (now - last_atr_refresh > 60 * 5):
@@ -340,32 +347,107 @@ def main():
             ):
                 sell_qty = floor_decimal(balance_base, step_size)
                 if sell_qty * price >= min_notional:
-                    proceeds = sell_qty * price
-                    realized_pl = proceeds - baseline_value
-                    cumulative_realized += realized_pl
+                    # Send notification BEFORE trade
+                    msg_before = f"🛑 ATR Stop Loss Triggered\n\nAbout to sell {sell_qty:.6f} {base_asset} at ~{price:.2f} {quote_asset}\nPrice dropped below trailing stop: {stop_loss_price:.2f}"
+                    send_telegram(msg_before)
 
-                    msg = f"🛑 ATR Stop Loss\n\nSold {sell_qty:.6f} {base_asset} at {price:.2f}\nP&L: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}"
-                    send_telegram(msg)
-                    place_market_sell(client, SYMBOL, sell_qty, step_size)
-                    log(
-                        f"ATR stop loss executed. Cumulative P&L: {cumulative_realized:.2f}"
-                    )
+                    # Execute trade
+                    try:
+                        order_result = place_market_sell(
+                            client, SYMBOL, sell_qty, step_size
+                        )
+                        # Get actual executed quantity and price from order
+                        executed_qty = Decimal(
+                            order_result.get("executedQty", str(sell_qty))
+                            if order_result
+                            else str(sell_qty)
+                        )
+                        # Get fills to calculate actual average price
+                        fills = order_result.get("fills", []) if order_result else []
+                        if fills:
+                            total_qty = sum(Decimal(f.get("qty", "0")) for f in fills)
+                            total_cost = sum(
+                                Decimal(f.get("price", "0")) * Decimal(f.get("qty", "0"))
+                                for f in fills
+                            )
+                            actual_price = total_cost / total_qty if total_qty > 0 else price
+                        else:
+                            actual_price = price
+                        
+                        # Wait for balance to update
+                        time.sleep(1)
+                        new_balance_base = fetch_balance(client, base_asset)
+                        new_balance_quote = fetch_balance(client, quote_asset)
+                        new_portfolio_value = (new_balance_base * price) + new_balance_quote
+                        
+                        # P&L is the change in total portfolio value from baseline
+                        realized_pl = new_portfolio_value - baseline_value
+                        cumulative_realized += realized_pl
+
+                        # Send confirmation AFTER trade
+                        msg_after = f"✅ ATR Stop Loss Executed\n\nSold {executed_qty:.6f} {base_asset} at {actual_price:.2f} {quote_asset}\nP&L: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}\nNew portfolio: {new_portfolio_value:.2f} {quote_asset}"
+                        send_telegram(msg_after)
+
+                        log(
+                            f"ATR stop loss executed. Cumulative P&L: {cumulative_realized:.2f}, New portfolio: {new_portfolio_value:.2f}"
+                        )
+                    except Exception as e:
+                        log(f"ATR stop loss trade failed: {e}")
+                        send_telegram(f"❌ ATR Stop Loss Failed: {e}")
                     break
 
             # Portfolio-wide stop loss
             if current_value <= portfolio_stop_loss_value and balance_base > 0:
                 sell_qty = floor_decimal(balance_base, step_size)
                 if sell_qty * price >= min_notional:
-                    proceeds = sell_qty * price
-                    realized_pl = proceeds - baseline_value
-                    cumulative_realized += realized_pl
+                    # Send notification BEFORE trade
+                    loss_pct = ((current_value - baseline_value) / baseline_value) * 100
+                    msg_before = f"🛑 Portfolio Stop Loss Triggered\n\nAbout to sell {sell_qty:.6f} {base_asset} at ~{price:.2f} {quote_asset}\nPortfolio dropped {loss_pct:.2f}% below baseline"
+                    send_telegram(msg_before)
 
-                    msg = f"🛑 Portfolio Stop Loss\n\nSold {sell_qty:.6f} {base_asset} at {price:.2f}\nLoss: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}"
-                    send_telegram(msg)
-                    place_market_sell(client, SYMBOL, sell_qty, step_size)
-                    log(
-                        f"Portfolio stop loss executed. Cumulative P&L: {cumulative_realized:.2f}"
-                    )
+                    # Execute trade
+                    try:
+                        order_result = place_market_sell(
+                            client, SYMBOL, sell_qty, step_size
+                        )
+                        # Get actual executed quantity and price from order
+                        executed_qty = Decimal(
+                            order_result.get("executedQty", str(sell_qty))
+                            if order_result
+                            else str(sell_qty)
+                        )
+                        # Get fills to calculate actual average price
+                        fills = order_result.get("fills", []) if order_result else []
+                        if fills:
+                            total_qty = sum(Decimal(f.get("qty", "0")) for f in fills)
+                            total_cost = sum(
+                                Decimal(f.get("price", "0")) * Decimal(f.get("qty", "0"))
+                                for f in fills
+                            )
+                            actual_price = total_cost / total_qty if total_qty > 0 else price
+                        else:
+                            actual_price = price
+                        
+                        # Wait for balance to update
+                        time.sleep(1)
+                        new_balance_base = fetch_balance(client, base_asset)
+                        new_balance_quote = fetch_balance(client, quote_asset)
+                        new_portfolio_value = (new_balance_base * price) + new_balance_quote
+                        
+                        # P&L is the change in total portfolio value from baseline
+                        realized_pl = new_portfolio_value - baseline_value
+                        cumulative_realized += realized_pl
+
+                        # Send confirmation AFTER trade
+                        msg_after = f"✅ Portfolio Stop Loss Executed\n\nSold {executed_qty:.6f} {base_asset} at {actual_price:.2f} {quote_asset}\nLoss: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}\nNew portfolio: {new_portfolio_value:.2f} {quote_asset}"
+                        send_telegram(msg_after)
+
+                        log(
+                            f"Portfolio stop loss executed. Cumulative P&L: {cumulative_realized:.2f}, New portfolio: {new_portfolio_value:.2f}"
+                        )
+                    except Exception as e:
+                        log(f"Portfolio stop loss trade failed: {e}")
+                        send_telegram(f"❌ Portfolio Stop Loss Failed: {e}")
                     break
 
             # Profit harvesting
@@ -387,59 +469,95 @@ def main():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                proceeds = sell_amount_base * price
-                realized_pl = proceeds - (sell_amount_base * entry_price)
-                cumulative_realized += realized_pl
+                # Send notification BEFORE trade
+                profit_pct = (profit_value / baseline_value) * 100
+                msg_before = f"💰 Profit Target Reached\n\nAbout to harvest profit:\n• Sell {sell_amount_base:.6f} {base_asset} at ~{price:.2f} {quote_asset}\n• Profit: {profit_pct:.2f}% ({profit_value:.2f} {quote_asset})"
+                send_telegram(msg_before)
 
-                msg = f"💰 Profit Harvested\n\nSold {sell_amount_base:.6f} {base_asset} at {price:.2f}\nProfit: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}"
-                send_telegram(msg)
+                # Execute trade
+                try:
+                    order_result = place_market_sell(
+                        client, SYMBOL, sell_amount_base, step_size
+                    )
+                    # Get actual executed quantity and price from order
+                    executed_qty = Decimal(
+                        order_result.get("executedQty", str(sell_amount_base))
+                        if order_result
+                        else str(sell_amount_base)
+                    )
+                    # Get fills to calculate actual average price
+                    fills = order_result.get("fills", []) if order_result else []
+                    if fills:
+                        total_qty = sum(Decimal(f.get("qty", "0")) for f in fills)
+                        total_cost = sum(
+                            Decimal(f.get("price", "0")) * Decimal(f.get("qty", "0"))
+                            for f in fills
+                        )
+                        actual_price = total_cost / total_qty if total_qty > 0 else price
+                    else:
+                        actual_price = price
+                    
+                    proceeds = executed_qty * actual_price
+                    realized_pl = proceeds - (executed_qty * entry_price)
+                    cumulative_realized += realized_pl
 
-                place_market_sell(client, SYMBOL, sell_amount_base, step_size)
+                    time.sleep(1)
+                    new_balance_base = fetch_balance(client, base_asset)
+                    new_balance_quote = fetch_balance(client, quote_asset)
+                    # Update baseline to new total portfolio value
+                    baseline_value = (new_balance_base * price) + new_balance_quote
+                    entry_price = price
 
-                time.sleep(1)
-                new_balance = fetch_balance(client, base_asset)
-                baseline_value = new_balance * price
-                entry_price = price
+                    # Send confirmation AFTER trade
+                    msg_after = f"✅ Profit Harvested\n\nSold {executed_qty:.6f} {base_asset} at {actual_price:.2f} {quote_asset}\nProfit: {realized_pl:.2f} {quote_asset}\nTotal realized: {cumulative_realized:.2f} {quote_asset}\nNew portfolio: {baseline_value:.2f} {quote_asset}"
+                    send_telegram(msg_after)
 
-                # Update stop loss
-                if use_atr_stop and atr:
-                    stop_loss_price = entry_price - (ATR_MULTIPLIER * atr)
+                    # Update stop loss
+                    if use_atr_stop and atr:
+                        stop_loss_price = entry_price - (ATR_MULTIPLIER * atr)
 
-                log(
-                    f"Harvest done. New baseline: {baseline_value:.2f}, Cumulative: {cumulative_realized:.2f}"
-                )
+                    log(
+                        f"Harvest done. New baseline: {baseline_value:.2f}, Cumulative: {cumulative_realized:.2f}"
+                    )
 
-                # Re-entry logic (if enabled and price dropped)
-                if REENTRY_STRATEGY != "none" and proceeds >= min_notional:
-                    # Only re-enter if price dropped significantly (e.g., 2% below entry)
-                    price_drop_threshold = entry_price * Decimal("0.98")
+                    # Re-entry logic (if enabled and price dropped)
+                    if REENTRY_STRATEGY != "none" and proceeds >= min_notional:
+                        # Only re-enter if price dropped significantly (e.g., 2% below entry)
+                        price_drop_threshold = entry_price * Decimal("0.98")
 
-                    if price <= price_drop_threshold:
-                        if REENTRY_STRATEGY == "fixed_fraction":
-                            buy_quote_qty = floor_decimal(
-                                proceeds * REENTRY_FRACTION, Decimal("0.01")
-                            )
-                            if buy_quote_qty >= min_notional:
-                                log(
-                                    f"Re-entry: Buying {buy_quote_qty:.2f} {quote_asset} worth"
+                        if price <= price_drop_threshold:
+                            if REENTRY_STRATEGY == "fixed_fraction":
+                                buy_quote_qty = floor_decimal(
+                                    proceeds * REENTRY_FRACTION, Decimal("0.01")
                                 )
-                                place_market_buy_quote(client, SYMBOL, buy_quote_qty)
-                                time.sleep(1)
-                                new_balance = fetch_balance(client, base_asset)
-                                baseline_value = new_balance * price
-                                entry_price = price
-                                if use_atr_stop and atr:
-                                    stop_loss_price = entry_price - (
-                                        ATR_MULTIPLIER * atr
+                                if buy_quote_qty >= min_notional:
+                                    log(
+                                        f"Re-entry: Buying {buy_quote_qty:.2f} {quote_asset} worth"
                                     )
+                                    place_market_buy_quote(client, SYMBOL, buy_quote_qty)
+                                    time.sleep(1)
+                                    new_balance_base = fetch_balance(client, base_asset)
+                                    new_balance_quote = fetch_balance(client, quote_asset)
+                                    # Update baseline to new total portfolio value
+                                    baseline_value = (new_balance_base * price) + new_balance_quote
+                                    entry_price = price
+                                    if use_atr_stop and atr:
+                                        stop_loss_price = entry_price - (
+                                            ATR_MULTIPLIER * atr
+                                        )
+                                    log(
+                                        f"Re-entry completed. New baseline: {baseline_value:.2f}"
+                                    )
+                            elif REENTRY_STRATEGY == "limit_ladder":
                                 log(
-                                    f"Re-entry completed. New baseline: {baseline_value:.2f}"
+                                    "Limit ladder re-entry not fully implemented (requires order tracking)"
                                 )
-                        elif REENTRY_STRATEGY == "limit_ladder":
-                            log(
-                                "Limit ladder re-entry not fully implemented (requires order tracking)"
-                            )
-                            # TODO: Implement limit ladder with order tracking
+                                # TODO: Implement limit ladder with order tracking
+                except Exception as e:
+                    log(f"Profit harvest trade failed: {e}")
+                    send_telegram(f"❌ Profit Harvest Failed: {e}")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
 
             time.sleep(CHECK_INTERVAL)
 
