@@ -1,0 +1,13 @@
+services:
+  bnb-bot:
+    build: .
+    container_name: bnb-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./bot.log:/app/bot.log
+    command: ["python", "main.py"]
+

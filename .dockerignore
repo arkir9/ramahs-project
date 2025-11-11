@@ -1,0 +1,13 @@
+.git
+.gitignore
+.cursorignore
+.DS_Store
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env.backup*
+*.log
+bot.log
+
